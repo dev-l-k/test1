@@ -4,6 +4,20 @@ import time
 
 board = pyfirmata.Arduino("/dev/ttyUSB1")
 
+# Add at the top after imports
+DEFAULT_SERVO_POS = 180
+THRESHOLDS = {
+    'fire': 0.5,
+    'lpg': 0.5,
+    'rain': 0.7,
+    'light': 45
+}
+
+# Initialize sensor variables before main loop
+fire_status = lpg_status = rain_status = ld_status = None
+ldper = 0
+ir_status = True
+
 # Define pins
 light = board.get_pin('d:2:o')
 gate = board.get_pin('d:10:s')
