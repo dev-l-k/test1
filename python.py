@@ -1,10 +1,8 @@
-import paho.mqtt.client as paho  # Import paho MQTT library
+import paho.mqtt.client as paho
 import pyfirmata
 import time
 
-board = pyfirmata.Arduino("/dev/ttyUSB1")
-
-# Add at the top after imports
+# Constants
 DEFAULT_SERVO_POS = 180
 THRESHOLDS = {
     'fire': 0.5,
@@ -12,11 +10,16 @@ THRESHOLDS = {
     'rain': 0.7,
     'light': 45
 }
+DEBOUNCE_DELAY = 0.1
+MQTT_BROKER = '192.168.248.70'
+MQTT_PORT = 1883
 
-# Initialize sensor variables before main loop
-fire_status = lpg_status = rain_status = ld_status = None
-ldper = 0
-ir_status = True
+# Initialize Arduino board
+try:
+    board = pyfirmata.Arduino("/dev/ttyUSB1")
+except:
+    print("Failed to connect to Arduino")
+    exit(1)
 
 # Define pins
 light = board.get_pin('d:2:o')
@@ -27,195 +30,184 @@ ld = board.get_pin('a:0:i')
 ir = board.get_pin('d:13:i')
 servo = board.get_pin('d:9:s')
 rain = board.get_pin('a:1:i')
-r = board.get_pin('d:6:p')  # Red LED on PWM pin
-g = board.get_pin('d:5:p')  # Green LED on PWM pin
+r = board.get_pin('d:6:p')
+g = board.get_pin('d:5:p')
 b = board.get_pin('d:11:p')
 buzzer = board.get_pin('d:12:o')
 servo2 = board.get_pin('d:3:s')
-button = board.get_pin('d:8:i')# Blue LED on PWM pin
+button = board.get_pin('d:8:i')
 
-# Start PyFirmata iterator to read input pins
+# Start PyFirmata iterator
 it = pyfirmata.util.Iterator(board)
 it.start()
 
-gate.write(180)
-servo2.write(180)
+# Initialize states
+gate.write(DEFAULT_SERVO_POS)
+servo2.write(DEFAULT_SERVO_POS)
 led_state = False
 prev_button_state = True
-# MQTT on_message callback
-def on_message_action(client, userdata, message):  # This function will be called on receiving messages
-    topic = message.topic  # Store topic
-    msg = message.payload.decode("utf-8")  # Decode the message
+last_button_time = 0
 
-    # Light control
+# Initialize sensor variables
+fire_status = lpg_status = rain_status = ld_status = None
+ldper = 0
+ir_status = True
+
+def read_sensor(pin, default=None):
+    """Safe sensor reading with default value"""
+    try:
+        value = pin.read()
+        return value if value is not None else default
+    except:
+        return default
+
+def handle_emergency():
+    """Handle fire/LPG emergency situations"""
+    if (read_sensor(fire, 1.0) < THRESHOLDS['fire'] or 
+        read_sensor(lpg, 0.0) > THRESHOLDS['lpg']):
+        servo.write(0)  # Close valve
+        for _ in range(3):  # Triple beep pattern
+            buzzer.write(1)
+            time.sleep(0.25)
+            buzzer.write(0)
+            time.sleep(0.15)
+        return True
+    return False
+
+def on_connect(client, userdata, flags, rc):
+    """MQTT connection callback"""
+    if rc == 0:
+        print("Connected to MQTT Broker!")
+        # Subscribe to topics
+        client.subscribe('LK/Light')
+        client.subscribe('LK/LPGR')
+        client.subscribe('LK/Gate')
+        client.subscribe('LK/CLOTHES')
+        client.subscribe('LK/R')
+        client.subscribe('LK/G')
+        client.subscribe('LK/B')
+    else:
+        print(f"Failed to connect, return code {rc}")
+
+def on_message_action(client, userdata, message):
+    """MQTT message callback"""
+    topic = message.topic
+    msg = message.payload.decode("utf-8")
+
     if topic == 'LK/Light':
         if msg == 'ON':
             light.write(1)
-            print('Topic:', topic)
-            print('Message:', msg)
         elif msg == 'OFF':
             light.write(0)
-            print('Topic:', topic)
-            print('Message:', msg)
         elif msg == 'OPEN':
-            if ldper < 45:
-                light.write(1)
-            else:
-                light.write(0)
-    if topic == 'LK/CLOTHES':
+            light.write(1 if ldper < THRESHOLDS['light'] else 0)
+
+    elif topic == 'LK/CLOTHES':
         if msg == 'OPEN':
-            servo2.write(180)
-            print('Topic:', topic)
-            print('Message:', msg)
+            servo2.write(DEFAULT_SERVO_POS)
         elif msg == 'CLOSE':
             servo2.write(0)
-            print('Topic:', topic)
-            print('Message:', msg)
         elif msg == 'ON':
             if rain_status is not None and ld_status is not None:
-                if ldper < 45:
+                if ldper < THRESHOLDS['light']:
                     servo2.write(0)
-                elif rain_status<0.7:
+                elif rain_status < THRESHOLDS['rain']:
                     mqtt_client.publish('LK/RAIN', 'DETECTED')
                     servo2.write(0)
                 else:
                     mqtt_client.publish('LK/RAIN', 'NOT DETECTED')
-                    servo2.write(180)
-            
-    if topic == 'LK/Gate':
+                    servo2.write(DEFAULT_SERVO_POS)
+
+    elif topic == 'LK/Gate':
         if msg == 'OPEN':
             gate.write(90)
-            print('Topic:', topic)
-            print('Message:', msg)# Open gate (set servo to 90 degrees)
         elif msg == 'CLOSE':
-            gate.write(180)
-            print('Topic:', topic)
-            print('Message:', msg)
+            gate.write(DEFAULT_SERVO_POS)
         elif msg == 'ON':
-            if ir_status == False:
+            if read_sensor(ir, True) == False:
                 gate.write(90)
                 time.sleep(5)
-                gate.write(180)
-            # Close gate (set servo to 0 degrees)
+                gate.write(DEFAULT_SERVO_POS)
 
-    # RGB LED control via sliders
-    if topic == 'LK/R':  # Red LED
-        r_value = round(float(msg) / 255.0,2)  # Normalize slider value (0-255) to PWM (0-1)
-        r.write(r_value)
-        print('Topic:', topic)
-        print('Message:', msg)
-    elif topic == 'LK/G':  # Green LED
-        g_value = round(float(msg) / 255.0,2)
-        g.write(g_value)
-        print('Topic:', topic)
-        print('Message:', msg)
-    elif topic == 'LK/B':  # Blue LED
-        b_value = round(float(msg) / 255.0,2)
-        b.write(b_value)
-        print('Topic:', topic)
-        print('Message:', msg)
-    if topic == 'LK/LPGR':
+    elif topic == 'LK/LPGR':
         if msg == 'OPEN':
             servo.write(100)
-            print('Topic:', topic)
-            print('Message:', msg)
         elif msg == 'CLOSE':
             servo.write(0)
-            print('Topic:', topic)
-            print('Message:', msg)
         elif msg == 'ON':
-            if fire_status < 0.5 or lpg_status > 0.5:
+            if (read_sensor(fire, 1.0) < THRESHOLDS['fire'] or 
+                read_sensor(lpg, 0.0) > THRESHOLDS['lpg']):
                 servo.write(0)
-                
             else:
                 servo.write(100)
-                
-            
-            
 
+    # RGB LED control
+    elif topic == 'LK/R':
+        r_value = round(float(msg) / 255.0, 2)
+        r.write(r_value)
+    elif topic == 'LK/G':
+        g_value = round(float(msg) / 255.0, 2)
+        g.write(g_value)
+    elif topic == 'LK/B':
+        b_value = round(float(msg) / 255.0, 2)
+        b.write(b_value)
 
 # Initialize MQTT client
-mqtt_client = paho.Client()  # Create paho client object
-mqtt_client.connect('192.168.248.70', 1883)  # Connect to MQTT broker (replace IP with your broker's IP)
-mqtt_client.loop_start()  # Start MQTT client thread
-mqtt_client.on_message = on_message_action  # Link callback function for incoming messages
+mqtt_client = paho.Client()
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message_action
 
-# Subscribe to topics
-mqtt_client.subscribe('LK/Light')
-mqtt_client.subscribe('LK/LPGR')
-mqtt_client.subscribe('LK/Gate')
-mqtt_client.subscribe('LK/CLOTHES')
-mqtt_client.subscribe('LK/R')  # For Red LED slider
-mqtt_client.subscribe('LK/G')  # For Green LED slider
-mqtt_client.subscribe('LK/B')  # For Blue LED slider
+try:
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    mqtt_client.loop_start()
+except Exception as e:
+    print(f"MQTT connection error: {e}")
+    board.exit()
+    exit(1)
 
-# Continuous sensor monitoring and publishing
+# Main loop
 try:
     while True:
-        time.sleep(0.2)
-        fire_status = fire.read()
-        if fire_status is not None:
-            if fire_status < 0.5:
-                mqtt_client.publish('LK/Fire', 'False')
-            else:
-                mqtt_client.publish('LK/Fire', 'True')
-            
-
-        lpg_status = lpg.read()
-        if lpg_status is not None:
-            if lpg_status > 0.5:
-                mqtt_client.publish('LK/Lpg', 'False')
-            else:
-                mqtt_client.publish('LK/Lpg', 'True')
-        if lpg_status is not None:
-            if fire_status < 0.5 or lpg_status > 0.5:
-                buzzer.write(1)
-                time.sleep(0.25)
-                buzzer.write(0)
-                time.sleep(0.15)
-            else:
-                buzzer.write(0)
-        
-            
-        
-        
-        ld_status = ld.read()
+        # Read all sensors
+        fire_status = read_sensor(fire, 1.0)
+        lpg_status = read_sensor(lpg, 0.0)
+        ld_status = read_sensor(ld)
+        rain_status = read_sensor(rain)
+        ir_status = read_sensor(ir, True)
         
         if ld_status is not None:
-            ldper = round(100 - (ld_status * 100), 2)# Convert to percentage
-            mqtt_client.publish('LK/Ld', ldper)
-
-        led_status = light.read()
-        mqtt_client.publish('LK/LightR', led_status)
-
-        servo_status = gate.read()
-        mqtt_client.publish('LK/GateR', servo_status)
-
-        ir_status = ir.read()
-        if ir_status is not None:
-             mqtt_client.publish('LK/Theif', ir_status)
-        # Fire and LPG emergency actions
-       
-
-        lpg_valve = servo.read()
-        mqtt_client.publish('LK/LPGv', lpg_valve)
-
-        # Rain detection
-        rain_status = rain.read()
+            ldper = round(100 - (ld_status * 100), 2)
         
-        button_state=button.read()
-        if button_state is False and prev_button_state is True:
-            led_state = not led_state# Button pressed (LOW due to pull-up)
+        # Handle button with debounce
+        current_time = time.time()
+        button_state = read_sensor(button, True)
+        if (button_state is False and 
+            prev_button_state is True and 
+            (current_time - last_button_time) > DEBOUNCE_DELAY):
+            led_state = not led_state
             light.write(led_state)
+            last_button_time = current_time
         prev_button_state = button_state
-        print (rain_status)
-        time.sleep(0.2)
-    
-    
-        pass
-          # Short delay
+        
+        # Check emergency
+        handle_emergency()
+        
+        # Publish status updates
+        mqtt_client.publish('LK/Fire', 'False' if fire_status < THRESHOLDS['fire'] else 'True')
+        mqtt_client.publish('LK/Lpg', 'False' if lpg_status > THRESHOLDS['lpg'] else 'True')
+        mqtt_client.publish('LK/Ld', ldper)
+        mqtt_client.publish('LK/LightR', light.read())
+        mqtt_client.publish('LK/GateR', gate.read())
+        mqtt_client.publish('LK/Theif', ir_status)
+        mqtt_client.publish('LK/LPGv', servo.read())
+        
+        time.sleep(0.1)
 
 except KeyboardInterrupt:
     print("Exiting Program...")
+    mqtt_client.loop_stop()
+    board.exit()
+except Exception as e:
+    print(f"Error: {e}")
     mqtt_client.loop_stop()
     board.exit()
